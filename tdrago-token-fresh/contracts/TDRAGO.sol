@@ -15,7 +15,7 @@ import "@openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol";
  * @author ROZERO 2.0 Smart Contract Team
  * @notice Implementation of the TDRAGO token for GameFi ecosystem
  * @dev This contract implements an upgradeable ERC20 token with role-based access control
- *      using the UUPS proxy pattern for future upgrades
+ *      using the UUPS proxy pattern for future upgrades, with added safety mechanisms
  */
 contract TDRAGO is 
     Initializable, 
@@ -40,9 +40,39 @@ contract TDRAGO is
     bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
     
-    // ========== STORAGE V1 ==========
+    // ========== NEW STORAGE V2 ==========
+    /// @dev Treasury address to hold backup funds
+    address public treasury;
+    
+    /// @dev Maximum amount that can be withdrawn in a single transaction
+    uint256 public maxWithdrawalAmount;
+    
+    /// @dev Maximum amount that can be withdrawn by all addresses in a day
+    uint256 public dailyWithdrawalLimit;
+    
+    /// @dev Timelock duration for changing parameters (24 hours)
+    uint256 public constant TIMELOCK_DURATION = 1 days;
+    
+    /// @dev Structure for timelock proposals
+    struct TimelockProposal {
+        uint256 executeTime;
+        uint256 value;
+        address addressValue;
+        bool exists;
+    }
+    
+    /// @dev Mapping for pending parameter changes
+    mapping(bytes32 => TimelockProposal) public pendingProposals;
+    
+    /// @dev Mapping to track withdrawal amounts per day
+    mapping(uint256 => uint256) public dailyWithdrawalAmount;
+    
+    /// @dev Mapping to track withdrawal amounts per address
+    mapping(address => mapping(uint256 => uint256)) public addressDailyWithdrawal;
+    
+    // ========== STORAGE GAP ==========
     // Reserved slots for future upgrades
-    uint256[50] private __gap;
+    uint256[40] private __gap;
     
     // ========== EVENTS ==========
     /**
@@ -66,6 +96,28 @@ contract TDRAGO is
      */
     event Withdrawn(address indexed to, uint256 amount);
     
+    /**
+     * @dev Emitted when a parameter change is proposed
+     * @param proposalId The ID of the proposal
+     * @param paramName The name of the parameter
+     * @param executeTime The time when the proposal can be executed
+     */
+    event ParameterChangeProposed(bytes32 indexed proposalId, string paramName, uint256 executeTime);
+    
+    /**
+     * @dev Emitted when a parameter is updated
+     * @param paramName The name of the parameter
+     * @param value The new value
+     */
+    event ParameterUpdated(string paramName, uint256 value);
+    
+    /**
+     * @dev Emitted when treasury address is updated
+     * @param oldTreasury The previous treasury address
+     * @param newTreasury The new treasury address
+     */
+    event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
+    
     // ========== CUSTOM ERRORS ==========
     /// @dev Custom errors for gas efficiency
     error ZeroAddressNotAllowed();
@@ -73,6 +125,10 @@ contract TDRAGO is
     error InsufficientBalance(uint256 available, uint256 required);
     error NotAuthorized(bytes32 role, address account);
     error InvalidUpgrade();
+    error ExceedsMaxWithdrawalAmount(uint256 requested, uint256 maxAllowed);
+    error ExceedsDailyWithdrawalLimit(uint256 requested, uint256 remaining);
+    error TimelockNotExpired(uint256 current, uint256 required);
+    error ProposalDoesNotExist(bytes32 proposalId);
     
     // ========== INITIALIZER ==========
     /**
@@ -86,9 +142,11 @@ contract TDRAGO is
     /**
      * @dev Initializes the contract instead of a constructor
      * @param admin Address that will be granted the DEFAULT_ADMIN_ROLE
+     * @param treasuryAddress Address that will hold backup funds
      */
-    function initialize(address admin) external initializer {
+    function initialize(address admin, address treasuryAddress) external initializer {
         if (admin == address(0)) revert ZeroAddressNotAllowed();
+        if (treasuryAddress == address(0)) revert ZeroAddressNotAllowed();
         
         // Initialize parent contracts
         __ERC20_init("TDRAGO", "TDRAGO");
@@ -103,8 +161,30 @@ contract TDRAGO is
         _grantRole(UPGRADER_ROLE, admin);
         _grantRole(PAUSER_ROLE, admin);
         
+        // Set up treasury
+        treasury = treasuryAddress;
+        
+        // Set default limits
+        maxWithdrawalAmount = 100_000 * 10**decimals(); // 100,000 TDRAGO
+        dailyWithdrawalLimit = 1_000_000 * 10**decimals(); // 1,000,000 TDRAGO
+        
         // Initial roles can be granted to admin, but best practice is to separate concerns
         // and grant specific roles to appropriate addresses in a separate transaction
+    }
+    
+    /**
+     * @dev Initializes the V2 storage when upgrading
+     * @param treasuryAddress Address that will hold backup funds
+     */
+    function initializeV2(address treasuryAddress) external reinitializer(2) onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (treasuryAddress == address(0)) revert ZeroAddressNotAllowed();
+        
+        // Set up treasury
+        treasury = treasuryAddress;
+        
+        // Set default limits
+        maxWithdrawalAmount = 100_000 * 10**decimals(); // 100,000 TDRAGO
+        dailyWithdrawalLimit = 1_000_000 * 10**decimals(); // 1,000,000 TDRAGO
     }
     
     // ========== ADMIN FUNCTIONS ==========
@@ -122,6 +202,106 @@ contract TDRAGO is
      */
     function unpause() external onlyRole(PAUSER_ROLE) {
         _unpause();
+    }
+    
+    // ========== PARAMETER MANAGEMENT ==========
+    /**
+     * @dev Proposes a change to the maximum withdrawal amount
+     * @param newMaxAmount The new maximum withdrawal amount
+     */
+    function proposeMaxWithdrawalChange(uint256 newMaxAmount) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        bytes32 proposalId = keccak256(abi.encodePacked("MAX_WITHDRAWAL", block.timestamp));
+        
+        pendingProposals[proposalId] = TimelockProposal({
+            executeTime: block.timestamp + TIMELOCK_DURATION,
+            value: newMaxAmount,
+            addressValue: address(0),
+            exists: true
+        });
+        
+        emit ParameterChangeProposed(proposalId, "MAX_WITHDRAWAL", block.timestamp + TIMELOCK_DURATION);
+    }
+    
+    /**
+     * @dev Executes a change to the maximum withdrawal amount
+     * @param proposalId The ID of the proposal to execute
+     */
+    function executeMaxWithdrawalChange(bytes32 proposalId) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        TimelockProposal memory proposal = pendingProposals[proposalId];
+        if (!proposal.exists) revert ProposalDoesNotExist(proposalId);
+        if (block.timestamp < proposal.executeTime) revert TimelockNotExpired(block.timestamp, proposal.executeTime);
+        
+        maxWithdrawalAmount = proposal.value;
+        delete pendingProposals[proposalId];
+        
+        emit ParameterUpdated("MAX_WITHDRAWAL", proposal.value);
+    }
+    
+    /**
+     * @dev Proposes a change to the daily withdrawal limit
+     * @param newDailyLimit The new daily withdrawal limit
+     */
+    function proposeDailyLimitChange(uint256 newDailyLimit) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        bytes32 proposalId = keccak256(abi.encodePacked("DAILY_LIMIT", block.timestamp));
+        
+        pendingProposals[proposalId] = TimelockProposal({
+            executeTime: block.timestamp + TIMELOCK_DURATION,
+            value: newDailyLimit,
+            addressValue: address(0),
+            exists: true
+        });
+        
+        emit ParameterChangeProposed(proposalId, "DAILY_LIMIT", block.timestamp + TIMELOCK_DURATION);
+    }
+    
+    /**
+     * @dev Executes a change to the daily withdrawal limit
+     * @param proposalId The ID of the proposal to execute
+     */
+    function executeDailyLimitChange(bytes32 proposalId) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        TimelockProposal memory proposal = pendingProposals[proposalId];
+        if (!proposal.exists) revert ProposalDoesNotExist(proposalId);
+        if (block.timestamp < proposal.executeTime) revert TimelockNotExpired(block.timestamp, proposal.executeTime);
+        
+        dailyWithdrawalLimit = proposal.value;
+        delete pendingProposals[proposalId];
+        
+        emit ParameterUpdated("DAILY_LIMIT", proposal.value);
+    }
+    
+    /**
+     * @dev Proposes a change to the treasury address
+     * @param newTreasury The new treasury address
+     */
+    function proposeTreasuryChange(address newTreasury) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (newTreasury == address(0)) revert ZeroAddressNotAllowed();
+        
+        bytes32 proposalId = keccak256(abi.encodePacked("TREASURY", block.timestamp));
+        
+        pendingProposals[proposalId] = TimelockProposal({
+            executeTime: block.timestamp + TIMELOCK_DURATION,
+            value: 0,
+            addressValue: newTreasury,
+            exists: true
+        });
+        
+        emit ParameterChangeProposed(proposalId, "TREASURY", block.timestamp + TIMELOCK_DURATION);
+    }
+    
+    /**
+     * @dev Executes a change to the treasury address
+     * @param proposalId The ID of the proposal to execute
+     */
+    function executeTreasuryChange(bytes32 proposalId) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        TimelockProposal memory proposal = pendingProposals[proposalId];
+        if (!proposal.exists) revert ProposalDoesNotExist(proposalId);
+        if (block.timestamp < proposal.executeTime) revert TimelockNotExpired(block.timestamp, proposal.executeTime);
+        
+        address oldTreasury = treasury;
+        treasury = proposal.addressValue;
+        delete pendingProposals[proposalId];
+        
+        emit TreasuryUpdated(oldTreasury, proposal.addressValue);
     }
     
     // ========== CORE FUNCTIONS ==========
@@ -169,7 +349,15 @@ contract TDRAGO is
     }
     
     /**
-     * @dev Withdraws tokens to a player's wallet 
+     * @dev Gets the current day number (since Unix epoch)
+     * @return The current day number
+     */
+    function _getCurrentDay() internal view returns (uint256) {
+        return block.timestamp / 1 days;
+    }
+    
+    /**
+     * @dev Withdraws tokens to a player's wallet with additional safety checks
      * @param to Address of the player receiving tokens
      * @param amount Amount of tokens to withdraw
      * @notice Can only be called by accounts with WITHDRAWER_ROLE
@@ -184,10 +372,71 @@ contract TDRAGO is
         if (to == address(0)) revert ZeroAddressNotAllowed();
         if (amount == 0) revert ZeroAmountNotAllowed();
         
+        // Check transaction limits
+        if (amount > maxWithdrawalAmount) {
+            revert ExceedsMaxWithdrawalAmount(amount, maxWithdrawalAmount);
+        }
+        
+        // Check daily limits
+        uint256 currentDay = _getCurrentDay();
+        uint256 newDailyTotal = dailyWithdrawalAmount[currentDay] + amount;
+        if (newDailyTotal > dailyWithdrawalLimit) {
+            revert ExceedsDailyWithdrawalLimit(
+                amount, 
+                dailyWithdrawalLimit - dailyWithdrawalAmount[currentDay]
+            );
+        }
+        
+        // Update tracking
+        dailyWithdrawalAmount[currentDay] += amount;
+        addressDailyWithdrawal[to][currentDay] += amount;
+        
         // Mints tokens directly to recipient
         _mint(to, amount);
         
         emit Withdrawn(to, amount);
+    }
+    
+    /**
+     * @dev Gets the remaining daily withdrawal limit
+     * @return Remaining amount that can be withdrawn today
+     */
+    function getRemainingDailyLimit() external view returns (uint256) {
+        uint256 currentDay = _getCurrentDay();
+        uint256 used = dailyWithdrawalAmount[currentDay];
+        
+        if (used >= dailyWithdrawalLimit) {
+            return 0;
+        }
+        
+        return dailyWithdrawalLimit - used;
+    }
+    
+    /**
+     * @dev Gets the daily withdrawal amount for a specific address
+     * @param account The address to check
+     * @return Amount withdrawn by the account today
+     */
+    function getAddressDailyWithdrawal(address account) external view returns (uint256) {
+        return addressDailyWithdrawal[account][_getCurrentDay()];
+    }
+    
+    /**
+     * @dev Burns tokens and mints them to the treasury
+     * @param amount Amount to fund the treasury with
+     * @notice Burns tokens from caller and mints to treasury
+     */
+    function fundTreasury(uint256 amount) external whenNotPaused {
+        if (amount == 0) revert ZeroAmountNotAllowed();
+        
+        // Burn tokens from sender
+        super.burn(amount);
+        
+        // Mint to treasury
+        _mint(treasury, amount);
+        
+        emit Burned(_msgSender(), amount);
+        emit Minted(treasury, amount);
     }
     
     // ========== OVERRIDE FUNCTIONS ==========

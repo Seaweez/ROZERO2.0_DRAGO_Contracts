@@ -1,55 +1,69 @@
+// test/TDRAGO.test.ts
 import { expect } from "chai";
 import { ethers, upgrades } from "hardhat";
+import { Contract } from "ethers";
 
-describe("TDRAGO Token", function () {
-  async function deployTokenFixture() {
-    // Get signers
-    const [deployer, user1, user2] = await ethers.getSigners();
-    
-    // Deploy the contract
+describe("TDRAGO", function () {
+  let tdrago: Contract;
+  let admin: any;
+  let user: any;
+  let treasury: any;
+
+  beforeEach(async function () {
+    [admin, user, treasury] = await ethers.getSigners();
+
     const TDRAGO = await ethers.getContractFactory("TDRAGO");
-    const token = await upgrades.deployProxy(
-      TDRAGO,
-      [deployer.address], // Initialize with the owner as admin
-      {
-        kind: "uups",
-        initializer: "initialize",
-      }
-    );
-    
-    // Get role constants
-    const minterRole = await token.MINTER_ROLE();
-    const withdrawerRole = await token.WITHDRAWER_ROLE();
-    
-    // Grant roles for testing
-    await token.grantRole(minterRole, deployer.address);
-    await token.grantRole(withdrawerRole, deployer.address);
-    
-    return { token, deployer, user1, user2, minterRole, withdrawerRole };
-  }
-  
-  it("Should initialize with correct name and symbol", async function () {
-    const { token } = await deployTokenFixture();
-    expect(await token.name()).to.equal("TDRAGO");
-    expect(await token.symbol()).to.equal("TDRAGO");
-    expect(await token.decimals()).to.equal(18);
+    tdrago = await upgrades.deployProxy(TDRAGO, [admin.address, treasury.address], {
+      initializer: "initialize",
+      kind: "uups",
+    });
+    await tdrago.waitForDeployment();
+  });
+
+  it("should have correct name and symbol", async function () {
+    expect(await tdrago.name()).to.equal("TDRAGO");
+    expect(await tdrago.symbol()).to.equal("TDRAGO");
+  });
+
+  it("should allow MINTER_ROLE to mint tokens", async function () {
+    await tdrago.grantRole(await tdrago.MINTER_ROLE(), admin.address);
+    await expect(tdrago.mint(user.address, ethers.parseEther("100")))
+      .to.emit(tdrago, "Minted")
+      .withArgs(user.address, ethers.parseEther("100"));
+    expect(await tdrago.balanceOf(user.address)).to.equal(ethers.parseEther("100"));
+  });
+
+  it("should prevent non-minter from minting", async function () {
+    await expect(tdrago.connect(user).mint(user.address, ethers.parseEther("100"))).to.be.reverted;
+  });
+
+  it("should allow user to burn their tokens", async function () {
+    await tdrago.grantRole(await tdrago.MINTER_ROLE(), admin.address);
+    await tdrago.mint(user.address, ethers.parseEther("50"));
+    await tdrago.connect(user).burn(ethers.parseEther("10"));
+    expect(await tdrago.balanceOf(user.address)).to.equal(ethers.parseEther("40"));
+  });
+
+  it("should only allow WITHDRAWER_ROLE to call withdraw()", async function () {
+    await tdrago.grantRole(await tdrago.WITHDRAWER_ROLE(), admin.address);
+    await expect(tdrago.withdraw(user.address, ethers.parseEther("10")))
+      .to.emit(tdrago, "Withdrawn")
+      .withArgs(user.address, ethers.parseEther("10"));
+    expect(await tdrago.balanceOf(user.address)).to.equal(ethers.parseEther("10"));
+  });
+
+  it("should fail withdraw if amount exceeds daily limit using native BigInt", async function () {
+    await tdrago.grantRole(await tdrago.WITHDRAWER_ROLE(), admin.address);
+    const overLimit = await tdrago.dailyWithdrawalLimit();
+    const tooMuch = overLimit + 1n; // BigInt addition
+    await expect(tdrago.withdraw(user.address, tooMuch)).to.be.reverted;
+  });
+
+  it("should fail withdraw if amount exceeds daily limit using manual BigInt conversion", async function () {
+    await tdrago.grantRole(await tdrago.WITHDRAWER_ROLE(), admin.address);
+    const overLimit = await tdrago.dailyWithdrawalLimit(); // bigint
+    const tooMuch = BigInt(overLimit) + BigInt(1); // manual BigInt arithmetic
+    await expect(tdrago.withdraw(user.address, tooMuch)).to.be.reverted;
   });
   
-  it("Should allow minting tokens", async function () {
-    const { token, deployer, user1 } = await deployTokenFixture();
-    
-    const mintAmount = ethers.parseEther("100");
-    await token.mint(user1.address, mintAmount);
-    
-    expect(await token.balanceOf(user1.address)).to.equal(mintAmount);
-  });
-  
-  it("Should emit Minted event", async function () {
-    const { token, deployer, user1 } = await deployTokenFixture();
-    
-    const mintAmount = ethers.parseEther("100");
-    await expect(token.mint(user1.address, mintAmount))
-      .to.emit(token, "Minted")
-      .withArgs(user1.address, mintAmount);
-  });
 });
