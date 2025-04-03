@@ -2,29 +2,62 @@ import { ethers } from "hardhat";
 import * as dotenv from "dotenv";
 dotenv.config();
 
-const PROXY_ADDRESS = process.env.PROXY_ADDRESS!;
-const RECIPIENT_ADDRESS = process.env.TREASURY_ADDRESS!;
+async function tokenInteraction() {
+  // Get contract address and addresses to work with
+  const proxyAddress = process.env.PROXY_ADDRESS;
+  const adminAddress = process.env.ADMIN_ADDRESS;
+  const treasuryAddress = process.env.TREASURY_ADDRESS;
 
-async function main() {
-  const [deployer] = await ethers.getSigners();
-  console.log(`Using signer: ${deployer.address}`);
+  if (!proxyAddress || !adminAddress || !treasuryAddress) {
+    throw new Error("Missing required addresses in .env");
+  }
 
-  const tdrago = await ethers.getContractAt("TDRAGO", PROXY_ADDRESS);
+  // Connect to the contract
+  const tdrago = await ethers.getContractAt("TDRAGO", proxyAddress);
 
-  const amount = ethers.parseEther("1000");
-  console.log(`Minting ${ethers.formatEther(amount)} TDRAGO to ${RECIPIENT_ADDRESS}`);
+  // Get the signer
+  const [signer] = await ethers.getSigners();
 
-  const tx = await tdrago.mint(RECIPIENT_ADDRESS, amount);
-  await tx.wait();
+  console.log("🚀 TDRAGO Token Interaction");
+  console.log("---------------------------");
 
-  const balance = await tdrago.balanceOf(RECIPIENT_ADDRESS);
-  console.log(`Recipient balance: ${ethers.formatEther(balance)} TDRAGO`);
+  // Check basic token information
+  console.log("\n📊 Token Details:");
+  console.log("Name:", await tdrago.name());
+  console.log("Symbol:", await tdrago.symbol());
+  console.log("Decimals:", await tdrago.decimals());
 
+  // Check total supply
   const totalSupply = await tdrago.totalSupply();
-  console.log(`Total supply: ${ethers.formatEther(totalSupply)} TDRAGO`);
+  console.log("Total Supply:", ethers.formatEther(totalSupply), "TDRAGO");
+
+  // Check treasury details
+  console.log("\n🏦 Treasury Information:");
+  console.log("Treasury Address:", await tdrago.treasury());
+  console.log("Daily Withdrawal Limit:", 
+    ethers.formatEther(await tdrago.dailyWithdrawalLimit()), 
+    "TDRAGO"
+  );
+
+  // Demonstrate minting (requires MINTER_ROLE)
+  try {
+    const mintAmount = ethers.parseEther("1000");
+    console.log("\n💰 Minting Tokens:");
+    console.log(`Minting ${ethers.formatEther(mintAmount)} TDRAGO to Treasury`);
+    
+    const tx = await tdrago.mint(treasuryAddress, mintAmount);
+    await tx.wait();
+    
+    const treasuryBalance = await tdrago.balanceOf(treasuryAddress);
+    console.log("Treasury Balance:", ethers.formatEther(treasuryBalance), "TDRAGO");
+  } catch (error) {
+    console.error("❌ Minting failed:", error);
+  }
 }
 
-main().catch((err) => {
-  console.error("Error during test interaction:", err);
-  process.exit(1);
-});
+tokenInteraction()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error("Token interaction failed:", error);
+    process.exit(1);
+  });
